@@ -1,0 +1,292 @@
+#!/bin/bash
+set -euo pipefail
+
+# ─────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────
+readonly CURRENT_DIR="$(pwd)"
+readonly OUTPUT_DIR="$CURRENT_DIR"
+readonly DATE=$(date +%Y-%m-%d)
+readonly TOOLS=(whois dig amass assetfinder findomain github-subdomains waybackrecon httpx jq)
+
+# ─────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────
+log_info()  { echo -n "[*] $*"; }
+log_ok()    { echo -e  "\r[+] $*"; }
+log_err()   { echo -n "[-] $*" >&2; }
+
+check_tools() {
+    local missing=()
+    for tool in "${TOOLS[@]}"; do
+        command -v "$tool" &>/dev/null || missing+=("$tool")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_err "Herramientas faltantes: ${missing[*]}"
+        exit 1
+    fi
+}
+
+load_env_vars() {
+    if [ -f .env ]; then
+        set -o allexport
+        source .env
+        set +o allexport
+}
+
+init_output_dirs() {
+    local domain=$1
+    local base="$OUTPUT_DIR/$domain"
+    mkdir -p \
+        "$base/whois" \
+        "$base/dns" \
+        "$base/subdomains" \
+        "$base/http"
+    echo "$base"
+}
+
+# ─────────────────────────────────────────
+# MÓDULOS DE ESCANEO
+# ─────────────────────────────────────────
+run_whois() {
+    local domain=$1 base=$2
+    local out="$base/whois/whois.txt"
+
+    log_info "WHOIS -> $domain"
+    whois "$domain" > "$out" 2>/dev/null
+    log_ok "WHOIS completado -> $out"
+}
+
+run_dig() {
+    local domain=$1 base=$2
+    local out="$base/dns/records.txt"
+
+    log_info "DIG -> $domain"
+    {
+        for record in A MX NS TXT SOA; do
+            echo "--- $record ---"
+            dig "$domain" "$record" +short 2>/dev/null
+        done
+    } > "$out"
+    log_ok "DIG completado -> $out"
+}
+
+run_amass() {
+    local domain=$1 base=$2
+    local out="$base/subdomains/amass.txt"
+
+    log_info "AMASS -> $domain"
+    amass enum -passive -d "$domain" -silent -timeout 10 -o "$out" 2>/dev/null
+    log_ok "AMASS completado -> $out"
+}
+
+run_assetfinder() {
+    local domain=$1 base=$2
+    local out="$base/subdomains/assetfinder.txt"
+
+    log_info "ASSETFINDER -> $domain"
+    assetfinder "$domain" -subs-only > "$out"
+    log_ok "ASSETFINDER completado -> $out"
+}
+
+run_findomain() {
+    local domain=$1 base=$2
+    local out="$base/subdomains/findomain.txt"
+
+    log_info "FINDOMAIN -> $domain"
+    findomain -t "$domain" -q --unique-output "$out" 1>/dev/null
+    log_ok "FINDOMAIN completado -> $out"
+}
+
+run_github_subdomains() {
+    local domain=$1 base=$2
+    local out="$base/subdomains/github_subdomains.txt"
+
+    log_info "GITHUB-SUBDOMAINS -> $domain"
+    github-subdomains -d "$domain" -q -t "$GITHUB_TOKEN" -o "$out"
+    log_ok "GITHUB-SUBDOMAINS completado -> $out"
+}
+
+run_waybackrecon() {
+    local domain=$1 base=$2
+    local out_all="$base/subdomains/waybackmachine_urls.txt"
+    local out="$base/subdomains/waybackrecon.txt"
+
+    log_info "WAYBACKRECON -> $domain"
+    waybackrecon "$domain" >  "$out_all"
+    getlinks "$out_all" > "$out"
+    log_ok "WAYBACKRECON completado -> $out"
+}
+
+run_merge_subdomains(){
+    local domain=$1 base=$2
+    local out="$base/subdomains/subdomains.txt"
+
+    log_info "MERGE_SUBDOMAINS -> $domain"
+    cat "$base/subdomains/amass.txt" \
+        "$base/subdomains/assetfinder.txt" \
+        "$base/subdomains/findomain.txt" \
+        "$base/subdomains/github_subdomains.txt" \
+        "$base/subdomains/waybackrecon.txt" | sort -u > "$out"
+    log_ok "MERGE_SUBDOMAINS completado -> $out"
+}
+
+run_httpx() {
+    local domain=$1 base=$2
+    local subdomains_file="$base/subdomains/subdomains.txt"
+    local out_httpx="$base/http/httpx.txt"
+    local out_resolved="$base/subdomains/resolved.txt"
+
+    if [[ ! -f "$subdomains_file" ]]; then
+        log_err "subdomains.txt no encontrado, ejecuta amass primero."
+        return 1
+    fi
+
+    log_info "HTTPX -> $domain"
+    httpx -l "$subdomains_file" \
+          -silent -sc -title -tech-detect -server \
+          -o "$out_httpx" 2>/dev/null
+
+    awk '{print $1}' "$out_httpx" > "$out_resolved"
+    log_ok "HTTPX completado -> $out_httpx"
+}
+
+# ─────────────────────────────────────────
+p# GENERADOR results.json
+# ─────────────────────────────────────────
+generate_json() {
+    local domain=$1 base=$2
+    local out="$base/results.json"
+
+    log_info "Generando results.json..."
+
+    # ── WHOIS ──
+    local registrar reg_date owner
+    registrar=$(grep -i "Registrar:"                "$base/whois/whois.txt" 2>/dev/null | head -1 | cut -d: -f2- | xargs || echo "N/A")
+    reg_date=$(grep -i "Creation Date:"             "$base/whois/whois.txt" 2>/dev/null | head -1 | cut -d: -f2- | xargs || echo "N/A")
+    owner=$(grep -i "Registrant Organization:"      "$base/whois/whois.txt" 2>/dev/null | head -1 | cut -d: -f2- | xargs || echo "N/A")
+
+    # ── DNS ──
+    local a_records mx_records ns_records txt_records
+    a_records=$(grep  -A5 "^--- A ---"   "$base/dns/records.txt" 2>/dev/null | grep -v "^---" | jq -Rn '[inputs]')
+    mx_records=$(grep -A5 "^--- MX ---"  "$base/dns/records.txt" 2>/dev/null | grep -v "^---" | jq -Rn '[inputs]')
+    ns_records=$(grep -A5 "^--- NS ---"  "$base/dns/records.txt" 2>/dev/null | grep -v "^---" | jq -Rn '[inputs]')
+    txt_records=$(grep -A5 "^--- TXT ---" "$base/dns/records.txt" 2>/dev/null | grep -v "^---" | jq -Rn '[inputs]')
+
+    # ── SUBDOMAINS ──
+    local subdomains
+    subdomains=$(cat "$base/subdomains/subdomains.txt" 2>/dev/null | jq -Rn '[inputs]')
+
+    # ── HTTPX ──
+    local httpx_json
+    httpx_json=$(awk '{print $0}' "$base/http/httpx.txt" 2>/dev/null | \
+        jq -Rn '
+        [inputs | select(length > 0) | {
+            url:    (split(" ")[0]),
+            status: (match("\\[(\\d{3})\\]").captures[0].string // "N/A"),
+            title:  (match("\\[title:([^\\]]+)\\]").captures[0].string // "N/A"),
+            server: (match("\\[([^\\]]*(?:nginx|apache|iis)[^\\]]*)\\]"; "i").captures[0].string // "N/A"),
+            tech:   (match("\\[tech:([^\\]]+)\\]").captures[0].string // "N/A")
+        }]' 2>/dev/null || echo "[]")
+
+    # ── Ensamblar JSON ──
+    jq -n \
+        --arg  domain     "$domain" \
+        --arg  date       "$DATE" \
+        --arg  registrar  "$registrar" \
+        --arg  reg_date   "$reg_date" \
+        --arg  owner      "$owner" \
+        --argjson a       "$a_records" \
+        --argjson mx      "$mx_records" \
+        --argjson ns      "$ns_records" \
+        --argjson txt     "$txt_records" \
+        --argjson subs    "$subdomains" \
+        --argjson httpx   "$httpx_json" \
+    '{
+        domain:     $domain,
+        date:       $date,
+        whois: {
+            registrar:     $registrar,
+            creation_date: $reg_date,
+            owner:         $owner
+        },
+        dns: {
+            A:   $a,
+            MX:  $mx,
+            NS:  $ns,
+            TXT: $txt
+        },
+        subdomains: $subs,
+        http:       $httpx
+    }' > "$out"
+
+    log_ok "results.json generado -> $out"
+}
+
+# ─────────────────────────────────────────
+# USAGE
+# ─────────────────────────────────────────
+usage() {
+    cat <<EOF
+Uso: $0 -d <dominio> [-m <modulo>]
+
+Opciones:
+  -d  Dominio objetivo
+  -m  Módulo: whois | dig | amass | httpx | all (default: all)
+  -h  Mostrar ayuda
+EOF
+    exit 1
+}
+
+# ─────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────
+main() {
+    local domain="" module="all"
+
+    while getopts "d:m:h" opt; do
+        case $opt in
+            d) domain=$OPTARG ;;
+            m) module=$OPTARG ;;
+            h) usage ;;
+            *) usage ;;
+        esac
+    done
+
+    [[ -z "$domain" ]] && usage
+
+    check_tools
+
+    local base
+    base=$(init_output_dirs "$domain")
+
+    case $module in
+        whois)             run_whois             "$domain" "$base" ;;
+        dig)               run_dig               "$domain" "$base" ;;
+        amass)             run_amass             "$domain" "$base" ;;
+        assetfinder)       run_assetfinder       "$domain" "$base" ;;
+        findomain)         run_findomain         "$domain" "$base" ;;
+        github_subdomains) run_github_subdomains "$domain" "$base" ;;
+        waybackrecon)      run_waybackrecon      "$domain" "$base" ;;
+        merge_subdomains)  run_merge_subdomains  "$domain" "$base" ;;
+        httpx)             run_httpx             "$domain" "$base" ;;
+        all)
+            run_whois             "$domain" "$base"
+            run_dig               "$domain" "$base"
+            run_amass             "$domain" "$base"
+            run_assetfinder       "$domain" "$base"
+            run_findomain         "$domain" "$base"
+            run_github_subdomains "$domain" "$base"
+            run_waybackrecon      "$domain" "$base"
+            run_merge_subdomains  "$domain" "$base"
+            run_httpx             "$domain" "$base"
+            generate_json         "$domain" "$base"
+            ;;
+        *) usage ;;
+    esac
+
+    echo ""
+    log_ok "Recon finalizado -> $base"
+}
+
+main "$@"
