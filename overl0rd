@@ -4,6 +4,7 @@ set -euo pipefail
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
+readonly TOOL_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 readonly CURRENT_DIR="$(pwd)"
 readonly OUTPUT_DIR="$CURRENT_DIR"
 readonly DATE=$(date +%Y-%m-%d)
@@ -28,10 +29,12 @@ check_tools() {
 }
 
 load_env_vars() {
-    if [ -f .env ]; then
+    local env_file="$TOOL_DIR/.env"
+    if [ -f "$env_file" ]; then
         set -o allexport
-        source .env
+        source "$env_file"
         set +o allexport
+    fi
 }
 
 init_output_dirs() {
@@ -76,7 +79,8 @@ run_amass() {
     local out="$base/subdomains/amass.txt"
 
     log_info "AMASS -> $domain"
-    amass enum -passive -d "$domain" -silent -timeout 10 -o "$out" 2>/dev/null
+    amass enum -passive -d "$domain" -silent -timeout 10 2>/dev/null
+    amass subs -d "$domain" -names -o "$out" 2>/dev/null
     log_ok "AMASS completado -> $out"
 }
 
@@ -103,7 +107,7 @@ run_github_subdomains() {
     local out="$base/subdomains/github_subdomains.txt"
 
     log_info "GITHUB-SUBDOMAINS -> $domain"
-    github-subdomains -d "$domain" -q -t "$GITHUB_TOKEN" -o "$out"
+    github-subdomains -d "$domain" -q -t "$GITHUB_TOKEN" -o "$out" >/dev/null 2>&1
     log_ok "GITHUB-SUBDOMAINS completado -> $out"
 }
 
@@ -145,14 +149,14 @@ run_httpx() {
     log_info "HTTPX -> $domain"
     httpx -l "$subdomains_file" \
           -silent -sc -title -tech-detect -server \
-          -o "$out_httpx" 2>/dev/null
+          -o "$out_httpx" >/dev/null 2>&1
 
     awk '{print $1}' "$out_httpx" > "$out_resolved"
     log_ok "HTTPX completado -> $out_httpx"
 }
 
 # ─────────────────────────────────────────
-p# GENERADOR results.json
+# GENERADOR results.json
 # ─────────────────────────────────────────
 generate_json() {
     local domain=$1 base=$2
@@ -256,6 +260,7 @@ main() {
     [[ -z "$domain" ]] && usage
 
     check_tools
+    load_env_vars
 
     local base
     base=$(init_output_dirs "$domain")
